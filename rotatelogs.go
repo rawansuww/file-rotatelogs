@@ -5,8 +5,11 @@
 package rotatelogs
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lestrrat-go/file-rotatelogs/internal/fileutil"
+	"github.com/Azure/azure-storage-blob-go/azblob"
 	strftime "github.com/lestrrat-go/strftime"
 	"github.com/pkg/errors"
 )
@@ -98,6 +101,30 @@ func New(p string, options ...Option) (*RotateLogs, error) {
 	}, nil
 }
 
+func (rl *RotateLogs) genFilename() string {
+	now := rl.clock.Now()
+
+	// XXX HACK: Truncate only happens in UTC semantics, apparently.
+	// observed values for truncating given time with 86400 secs:
+	//
+	// before truncation: 2018/06/01 03:54:54 2018-06-01T03:18:00+09:00
+	// after  truncation: 2018/06/01 03:54:54 2018-05-31T09:00:00+09:00
+	//
+	// This is really annoying when we want to truncate in local time
+	// so we hack: we take the apparent local time in the local zone,
+	// and pretend that it's in UTC. do our math, and put it back to
+	// the local zone
+	var base time.Time
+	if now.Location() != time.UTC {
+		base = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond(), time.UTC)
+		base = base.Truncate(time.Duration(rl.rotationTime))
+		base = time.Date(base.Year(), base.Month(), base.Day(), base.Hour(), base.Minute(), base.Second(), base.Nanosecond(), base.Location())
+	} else {
+		base = now.Truncate(time.Duration(rl.rotationTime))
+	}
+	return rl.pattern.FormatString(base)
+}
+
 // Write satisfies the io.Writer interface. It writes to the
 // appropriate file handle that is currently being used.
 // If we have reached rotation time, the target file gets
@@ -107,22 +134,21 @@ func (rl *RotateLogs) Write(p []byte) (n int, err error) {
 	rl.mutex.Lock()
 	defer rl.mutex.Unlock()
 
-	out, err := rl.getWriterNolock(false, false)
+	out, err := rl.getWriter_nolock(false, false)
 	if err != nil {
 		return 0, errors.Wrap(err, `failed to acquite target io.Writer`)
 	}
-
+	ExecuteUpload("./logs")
 	return out.Write(p)
 }
 
 // must be locked during this operation
-func (rl *RotateLogs) getWriterNolock(bailOnRotateFail, useGenerationalNames bool) (io.Writer, error) {
+func (rl *RotateLogs) getWriter_nolock(bailOnRotateFail, useGenerationalNames bool) (io.Writer, error) {
 	generation := rl.generation
 	previousFn := rl.curFn
-
 	// This filename contains the name of the "NEW" filename
 	// to log to, which may be newer than rl.currentFilename
-	baseFn := fileutil.GenerateFn(rl.pattern, rl.clock, rl.rotationTime)
+	baseFn := rl.genFilename()
 	filename := baseFn
 	var forceNewFile bool
 
@@ -161,19 +187,24 @@ func (rl *RotateLogs) getWriterNolock(bailOnRotateFail, useGenerationalNames boo
 			}
 			if _, err := os.Stat(name); err != nil {
 				filename = name
-
 				break
 			}
 			generation++
 		}
 	}
-
-	fh, err := fileutil.CreateFile(filename)
+	// make sure the dir is existed, eg:
+	// ./foo/bar/baz/hello.log must make sure ./foo/bar/baz is existed
+	dirname := filepath.Dir(filename)
+	if err := os.MkdirAll(dirname, 0755); err != nil {
+		return nil, errors.Wrapf(err, "failed to create directory %s", dirname)
+	}
+	// if we got here, then we need to create a file
+	fh, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil, errors.Wrapf(err, `failed to create a new file %v`, filename)
+		return nil, errors.Errorf("failed to open file %s: %s", rl.pattern, err)
 	}
 
-	if err := rl.rotateNolock(filename); err != nil {
+	if err := rl.rotate_nolock(filename); err != nil {
 		err = errors.Wrap(err, "failed to rotate")
 		if bailOnRotateFail {
 			// Failure to rotate is a problem, but it's really not a great
@@ -186,7 +217,6 @@ func (rl *RotateLogs) getWriterNolock(bailOnRotateFail, useGenerationalNames boo
 			if fh != nil { // probably can't happen, but being paranoid
 				fh.Close()
 			}
-
 			return nil, err
 		}
 		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
@@ -204,7 +234,6 @@ func (rl *RotateLogs) getWriterNolock(bailOnRotateFail, useGenerationalNames boo
 			current: filename,
 		})
 	}
-
 	return fh, nil
 }
 
@@ -213,7 +242,6 @@ func (rl *RotateLogs) getWriterNolock(bailOnRotateFail, useGenerationalNames boo
 func (rl *RotateLogs) CurrentFileName() string {
 	rl.mutex.RLock()
 	defer rl.mutex.RUnlock()
-
 	return rl.curFn
 }
 
@@ -233,7 +261,6 @@ func (g *cleanupGuard) Enable() {
 	defer g.mutex.Unlock()
 	g.enable = true
 }
-
 func (g *cleanupGuard) Run() {
 	g.fn()
 }
@@ -248,12 +275,95 @@ func (g *cleanupGuard) Run() {
 func (rl *RotateLogs) Rotate() error {
 	rl.mutex.Lock()
 	defer rl.mutex.Unlock()
-	_, err := rl.getWriterNolock(true, true)
+	if _, err := rl.getWriter_nolock(true, true); err != nil {
+		return err
+	}
 
-	return err
+	return nil
 }
 
-func (rl *RotateLogs) rotateNolock(filename string) error {
+func ExecuteUpload(path string) {
+	files, errW := walkDir(path)
+
+	if errW != nil {
+		fmt.Println("Error has occured:", errW)
+	} else {
+		var fFiles []string
+		for _, fName := range files {
+			if strings.Contains(fName, "log") {
+				fFiles = append(fFiles, fName)
+			}
+		}
+
+		m := make(map[string][]byte)
+		// Read file contents into memory
+		for _, fName := range fFiles {
+			fmt.Println("Found file:", fName)
+			dat, errR := ReadFile(fName)
+			if errR != nil {
+				fmt.Println("Error reading file:", fName, "Error:", errR)
+			} else {
+				fmt.Println("Finished reading bytes for file:", fName)
+				m[fName] = dat
+			}
+		}
+
+		// push file contents from memory to Azure
+		for _, fName := range fFiles {
+			fmt.Println("Started uploading: ", fName)
+			u, errU := UploadBytesToBlob(m[fName], fName)
+			if errU != nil {
+				fmt.Println("Error during upload: ", errU)
+			}
+			fmt.Println("Finished uploading to: ", u)
+			fmt.Println("==========================================================")
+		}
+	}
+}
+
+func walkDir(root string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			files = append(files, "./logs")
+		}
+		return nil
+	})
+	return files, err
+}
+
+func ReadFile(filePath string) ([]byte, error) {
+	dat, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	} else {
+		return dat, nil
+	}
+}
+
+func UploadBytesToBlob(b []byte, fN string) (string, error) {
+	azrKey, accountName, endPoint, container := GetAccountInfo()
+	u, _ := url.Parse(fmt.Sprint(endPoint, container, "/", fN))
+	credential, errC := azblob.NewSharedKeyCredential(accountName, azrKey)
+	if errC != nil {
+		return "", errC
+	}
+	blockBlobUrl := azblob.NewBlockBlobURL(*u, azblob.NewPipeline(credential, azblob.PipelineOptions{}))
+	ctx := context.Background()
+	o := azblob.UploadToBlockBlobOptions{}
+	_, errU := azblob.UploadBufferToBlockBlob(ctx, b, blockBlobUrl, o)
+	return blockBlobUrl.String(), errU
+}
+
+func GetAccountInfo() (string, string, string, string) {
+	azrKey := "wsFmtMfIQMImfozm7NczRd5/FOUyGGBCdxji+e6OOUA6vN5CJFe0OPqVr/ml+cay5spGF+Jd0LmiDmA4KpCfOw=="
+	azrBlobAccountName := "rawandemo"
+	azrPrimaryBlobServiceEndpoint := fmt.Sprintf("https://%s.blob.core.windows.net/", azrBlobAccountName)
+	azrBlobContainer := "loggy"
+	return azrKey, azrBlobAccountName, azrPrimaryBlobServiceEndpoint, azrBlobContainer
+}
+
+func (rl *RotateLogs) rotate_nolock(filename string) error {
 	lockfn := filename + `_lock`
 	fh, err := os.OpenFile(lockfn, os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
@@ -315,9 +425,7 @@ func (rl *RotateLogs) rotateNolock(filename string) error {
 	}
 
 	cutoff := rl.clock.Now().Add(-1 * rl.maxAge)
-
-	// the linter tells me to pre allocate this...
-	toUnlink := make([]string, 0, len(matches))
+	var toUnlink []string
 	for _, path := range matches {
 		// Ignore lock files
 		if strings.HasSuffix(path, "_lock") || strings.HasSuffix(path, "_symlink") {
@@ -362,6 +470,7 @@ func (rl *RotateLogs) rotateNolock(filename string) error {
 		// unlink files on a separate goroutine
 		for _, path := range toUnlink {
 			os.Remove(path)
+
 		}
 	}()
 
@@ -381,6 +490,5 @@ func (rl *RotateLogs) Close() error {
 
 	rl.outFh.Close()
 	rl.outFh = nil
-
 	return nil
 }
