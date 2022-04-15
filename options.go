@@ -6,6 +6,8 @@ import (
 	"github.com/lestrrat-go/file-rotatelogs/internal/option"
 )
 
+//try change
+
 const (
 	optkeyClock         = "clock"
 	optkeyHandler       = "handler"
